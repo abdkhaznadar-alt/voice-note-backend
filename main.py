@@ -63,7 +63,7 @@ app = FastAPI(title="VoiceNote AI Backend")
 # ---------------------------------------------------------------------------
 # Faster-Whisper — loaded once at startup, local, free, no API key needed.
 # ---------------------------------------------------------------------------
-MODEL_SIZE = "small"
+MODEL_SIZE = "tiny"
 COMPUTE_TYPE = "int8"
 
 logger.info(f"Loading Faster-Whisper model '{MODEL_SIZE}' (compute_type={COMPUTE_TYPE})...")
@@ -77,7 +77,7 @@ logger.info("Model loaded — server ready.")
 # Tune this to roughly your CPU core count; more than that just adds
 # contention rather than real throughput on a CPU-only box.
 # ---------------------------------------------------------------------------
-MAX_TRANSCRIBE_WORKERS = 2
+MAX_TRANSCRIBE_WORKERS = 1
 transcribe_executor = ThreadPoolExecutor(max_workers=MAX_TRANSCRIBE_WORKERS, thread_name_prefix="whisper-worker")
 
 # In-memory job store for the async /transcribe/start + /transcribe/status
