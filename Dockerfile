@@ -20,15 +20,27 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 # falls back to its own default mel-filter config when no
 # preprocessor_config.json is present, which is correct for standard Whisper
 # audio preprocessing, so nothing else needs to be copied.
+# CACHE_BUST forces this layer (and everything after it) to actually
+# re-run instead of reusing a stale cached result from a previous failed
+# attempt — bump this value whenever the conversion needs a fresh run.
+ARG CACHE_BUST=2
+
 # If the conversion fails for any reason (e.g. a future incompatible
 # ctranslate2/torch build), don't fail the whole deploy: leave the output
-# dir empty and let main.py fall back to the stock Whisper model at runtime.
-RUN (ct2-transformers-converter \
-    --model oddadmix/whisper-small-arabic-dialectal-v2 \
-    --output_dir /convert/whisper-small-arabic-dialectal-v2-ct2 \
-    --copy_files tokenizer_config.json \
-    --quantization int8 \
-    --force) || (echo "Dialect model conversion failed — will fall back to stock Whisper at runtime" && mkdir -p /convert/whisper-small-arabic-dialectal-v2-ct2)
+# dir empty and let main.py fall back to the stock Whisper model at
+# runtime. The real error is captured and printed either way, so it shows
+# up in the build logs instead of being silently swallowed.
+RUN echo "cache-bust: ${CACHE_BUST}" && \
+    (ct2-transformers-converter \
+        --model oddadmix/whisper-small-arabic-dialectal-v2 \
+        --output_dir /convert/whisper-small-arabic-dialectal-v2-ct2 \
+        --copy_files tokenizer_config.json \
+        --quantization int8 \
+        --force 2> /tmp/convert_error.log) || \
+    (echo "===== Dialect model conversion FAILED — full error below =====" && \
+     cat /tmp/convert_error.log && \
+     echo "===== Falling back to stock Whisper at runtime =====" && \
+     mkdir -p /convert/whisper-small-arabic-dialectal-v2-ct2)
 
 # ---------------------------------------------------------------------------
 # Stage 2: the actual runtime image (small — no torch/transformers here)

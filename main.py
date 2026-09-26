@@ -205,8 +205,23 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
                 low_confidence_texts.append(stripped)
             continue
 
+        # Per-segment repetition check (language-agnostic, unlike the
+        # compression_ratio approach that backfired on Arabic above): if
+        # collapsing repeated runs of words *within this one segment* removes
+        # most of it, the segment is dominated by a hallucinated loop (e.g.
+        # "hello hello hello hello..." x9) and should be dropped outright
+        # rather than shipped to the user half-repeated.
+        stripped = segment.text.strip()
+        word_count = len(stripped.split())
+        collapsed_segment = _collapse_repeated_phrases(stripped)
+        collapsed_word_count = len(collapsed_segment.split())
+        if word_count >= 6 and collapsed_word_count < word_count * 0.5:
+            dropped += 1
+            dropped_repetition += 1
+            continue
+
         kept += 1
-        texts.append(segment.text.strip())
+        texts.append(stripped)
 
         if job_id is not None and total_duration > 0:
             with jobs_lock:
@@ -235,7 +250,7 @@ def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
     X"), collapse it down to a single occurrence instead of shipping the
     repeated wall of text to the user."""
     words = text.split()
-    if len(words) < 9:
+    if len(words) < 3:
         return text
 
     result = []
@@ -243,7 +258,11 @@ def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
     n = len(words)
     while i < n:
         collapsed = False
-        for phrase_len in range(max_phrase_words, 1, -1):
+        # NOTE: range stops at 1 (inclusive) so single-word loops like
+        # "مرحباً مرحباً مرحباً..." are caught too — the previous version
+        # stopped at phrase_len=2 and let literal single-word repeats
+        # straight through.
+        for phrase_len in range(max_phrase_words, 0, -1):
             if i + phrase_len * 3 > n:
                 continue
             phrase = words[i : i + phrase_len]
