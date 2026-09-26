@@ -178,18 +178,17 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
                 if job.get("canceled"):
                     raise JobCanceled("Job canceled by user")
 
-        # compression_ratio_threshold on transcribe() only matters when
-        # temperature is a *list* (it triggers a retry at higher
-        # temperature); with temperature fixed at 0.0 there's no retry, so
-        # a high-compression (i.e. repetitive) segment is returned as-is.
-        # Check it ourselves: a segment that is mostly the same phrase
-        # repeated is the classic Whisper hallucination on silence/noise.
-        # This one is never worth falling back to — it's genuinely garbage.
-        compression_ratio = getattr(segment, "compression_ratio", 0.0)
-        if compression_ratio and compression_ratio > 2.4:
-            dropped += 1
-            dropped_repetition += 1
-            continue
+        # NOTE: we tried a per-segment compression_ratio > 2.4 cutoff here
+        # (the value OpenAI calibrated on English text) to catch repetition
+        # hallucinations. On real Arabic speech it backfired badly: 66 of 68
+        # segments in one recording were flagged and dropped, because Arabic
+        # text naturally compresses more (repeated short function words/
+        # suffixes: ال, و, ة...), so it hits an English-tuned threshold far
+        # more often even with zero actual repetition. Removed the
+        # per-segment check entirely; repetition hallucination is instead
+        # caught language-agnostically at the end, on the final joined text,
+        # by _collapse_repeated_phrases() (looks for an actual run of the
+        # same words repeated 3+ times, not a generic compression stat).
 
         # Drop segments that look like hallucinations on silence / noise.
         # These thresholds were too strict (no_speech_prob > 0.6 / avg_logprob
