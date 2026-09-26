@@ -140,6 +140,14 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
     segments, info = whisper_model.transcribe(
         tmp_path,
         beam_size=5,
+        # temperature=0 makes decoding deterministic (single pass, no
+        # fallback to higher-temperature sampling). Whisper's hallucinations
+        # mostly come from that fallback: when it's unsure, it retries with
+        # more randomness and starts inventing plausible-sounding words.
+        # Forcing temperature=0 trades a little robustness on very unclear
+        # audio for much less made-up text — the right trade for this app.
+        temperature=0.0,
+        compression_ratio_threshold=2.2,
         vad_filter=True,
         # The default VAD settings were cutting out real speech on this
         # audio (observed: 36s of a 41s recording flagged as "silence").
