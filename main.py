@@ -148,30 +148,26 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # audio for much less made-up text — the right trade for this app.
         temperature=0.0,
         compression_ratio_threshold=2.2,
-        # Turning VAD off entirely (previous attempt) was worse: with real
-        # silence fed to the model, it fell into the classic Whisper failure
-        # mode of looping the same phrase over and over ("repetition
-        # hallucination") — exactly what happened on the last test. So VAD
-        # needs to stay on to keep long silence away from the model, but
-        # min_silence_duration_ms=1000 (previous setting) was too short:
-        # a LOWER value makes it MORE aggressive (any short pause that long
-        # gets cut), which is what was eating real speech. Raising it means
-        # only genuinely long gaps get removed, while brief pauses inside
-        # normal speech are kept.
-        vad_filter=True,
-        vad_parameters={
-            "threshold": 0.3,
-            "min_silence_duration_ms": 2500,
-            "speech_pad_ms": 300,
-        },
+        # Confirmed (by the user, on continuous, uninterrupted real speech)
+        # that the Silero VAD model misclassifies this app's audio as ~94%
+        # silence regardless of threshold tuning — a structural mismatch
+        # with this audio's format/encoding, not a tuning problem. VAD is
+        # therefore off for good. Real silence is instead handled entirely
+        # by post-hoc, per-segment filtering below (no_speech_prob /
+        # avg_logprob) plus the compression_ratio + repeated-phrase checks
+        # that specifically catch the repetition-hallucination failure mode
+        # VAD was otherwise guarding against.
+        vad_filter=False,
         condition_on_previous_text=False,
         language=forced_language,
     )
 
     total_duration = getattr(info, "duration", None) or 0.0
     texts = []
+    low_confidence_texts = []  # dropped by no_speech/avg_logprob, but not repetition — used as a fallback
     kept = 0
     dropped = 0
+    dropped_repetition = 0
 
     for segment in segments:
         if job_id is not None:
@@ -182,24 +178,32 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
                 if job.get("canceled"):
                     raise JobCanceled("Job canceled by user")
 
-        # Drop segments that look like hallucinations on silence / noise.
-        # These thresholds were too strict (no_speech_prob > 0.6 / avg_logprob
-        # < -1.0) and were throwing away real dialect speech that the model
-        # is simply less confident about, leaving only a couple of words per
-        # recording. Loosened to only catch the clearest hallucinations.
-        if segment.no_speech_prob > 0.85 or segment.avg_logprob < -1.8:
-            dropped += 1
-            continue
-
         # compression_ratio_threshold on transcribe() only matters when
         # temperature is a *list* (it triggers a retry at higher
         # temperature); with temperature fixed at 0.0 there's no retry, so
         # a high-compression (i.e. repetitive) segment is returned as-is.
         # Check it ourselves: a segment that is mostly the same phrase
         # repeated is the classic Whisper hallucination on silence/noise.
+        # This one is never worth falling back to — it's genuinely garbage.
         compression_ratio = getattr(segment, "compression_ratio", 0.0)
         if compression_ratio and compression_ratio > 2.4:
             dropped += 1
+            dropped_repetition += 1
+            continue
+
+        # Drop segments that look like hallucinations on silence / noise.
+        # These thresholds were too strict (no_speech_prob > 0.6 / avg_logprob
+        # < -1.0) and were throwing away real dialect speech that the model
+        # is simply less confident about, leaving only a couple of words per
+        # recording. Loosened to only catch the clearest hallucinations —
+        # but a low-confidence segment is kept as a fallback below rather
+        # than being silently thrown away, since an imperfect transcript
+        # beats an empty one.
+        if segment.no_speech_prob > 0.85 or segment.avg_logprob < -1.8:
+            dropped += 1
+            stripped = segment.text.strip()
+            if stripped:
+                low_confidence_texts.append(stripped)
             continue
 
         kept += 1
@@ -210,7 +214,18 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
                 if job_id in jobs:
                     jobs[job_id]["progress"] = min(segment.end / total_duration, 0.99)
 
-    logger.info("Transcription segments: kept=%d dropped=%d", kept, dropped)
+    logger.info(
+        "Transcription segments: kept=%d dropped=%d (repetition=%d) low_confidence_fallback_available=%d",
+        kept, dropped, dropped_repetition, len(low_confidence_texts),
+    )
+
+    if not texts and low_confidence_texts:
+        # Nothing passed the confidence bar, but we did detect *some* speech
+        # (as opposed to the segment being cut for looping repetition, which
+        # is never used as a fallback). Better to hand back an imperfect
+        # transcript than a blank one.
+        logger.info("All segments were low-confidence; using them as a fallback instead of returning empty text.")
+        texts = low_confidence_texts
 
     return _collapse_repeated_phrases(" ".join(t for t in texts if t))
 
