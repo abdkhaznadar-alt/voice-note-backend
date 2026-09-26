@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 # CACHE_BUST forces this layer (and everything after it) to actually
 # re-run instead of reusing a stale cached result from a previous failed
 # attempt — bump this value whenever the conversion needs a fresh run.
-ARG CACHE_BUST=5
+ARG CACHE_BUST=6
 
 # If the conversion fails for any reason (e.g. a future incompatible
 # ctranslate2/torch build), don't fail the whole deploy: leave the output
