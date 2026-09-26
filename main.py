@@ -141,12 +141,24 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         tmp_path,
         beam_size=5,
         vad_filter=True,
+        # The default VAD settings were cutting out real speech on this
+        # audio (observed: 36s of a 41s recording flagged as "silence").
+        # A lower threshold + longer allowed silence gaps keeps quieter or
+        # slower dialect speech from being discarded before it ever reaches
+        # the model.
+        vad_parameters={
+            "threshold": 0.2,
+            "min_silence_duration_ms": 1000,
+            "speech_pad_ms": 400,
+        },
         condition_on_previous_text=False,
         language=forced_language,
     )
 
     total_duration = getattr(info, "duration", None) or 0.0
     texts = []
+    kept = 0
+    dropped = 0
 
     for segment in segments:
         if job_id is not None:
@@ -158,15 +170,23 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
                     raise JobCanceled("Job canceled by user")
 
         # Drop segments that look like hallucinations on silence / noise.
-        if segment.no_speech_prob > 0.6 or segment.avg_logprob < -1.0:
+        # These thresholds were too strict (no_speech_prob > 0.6 / avg_logprob
+        # < -1.0) and were throwing away real dialect speech that the model
+        # is simply less confident about, leaving only a couple of words per
+        # recording. Loosened to only catch the clearest hallucinations.
+        if segment.no_speech_prob > 0.85 or segment.avg_logprob < -1.8:
+            dropped += 1
             continue
 
+        kept += 1
         texts.append(segment.text.strip())
 
         if job_id is not None and total_duration > 0:
             with jobs_lock:
                 if job_id in jobs:
                     jobs[job_id]["progress"] = min(segment.end / total_duration, 0.99)
+
+    logger.info("Transcription segments: kept=%d dropped=%d", kept, dropped)
 
     return " ".join(t for t in texts if t)
 
