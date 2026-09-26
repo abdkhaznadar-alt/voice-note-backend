@@ -1,5 +1,5 @@
-transformers>=4.46,<5
+transformers==4.44.2
 torch==2.4.1
-ctranslate2==4.8.2
+ctranslate2==4.5.0
 protobuf
 sentencepiece
