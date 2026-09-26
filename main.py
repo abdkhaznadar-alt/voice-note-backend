@@ -132,6 +132,11 @@ Transcript:
 # Transcription core
 # ---------------------------------------------------------------------------
 def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id: Optional[str] = None) -> str:
+    # An empty string (sent by some clients to mean "auto-detect") is not a
+    # valid Whisper language code — only None triggers auto-detection.
+    if not forced_language:
+        forced_language = None
+
     segments, info = whisper_model.transcribe(
         tmp_path,
         beam_size=5,
