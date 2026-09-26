@@ -1,4 +1,4 @@
-transformers==4.44.2
+transformers==4.45.2
 torch==2.4.1
 ctranslate2==4.7.0
 protobuf
