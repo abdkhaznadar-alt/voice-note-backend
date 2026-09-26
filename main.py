@@ -158,7 +158,24 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # that specifically catch the repetition-hallucination failure mode
         # VAD was otherwise guarding against.
         vad_filter=False,
-        condition_on_previous_text=False,
+        # Whisper's own internal no_speech_threshold decides whether it even
+        # bothers decoding a stretch of audio at all (separate from our
+        # post-hoc filter below, which only runs on segments it DID decide
+        # to transcribe). Default is 0.6; raising it makes the model less
+        # trigger-happy about silently skipping borderline-quiet speech —
+        # observed as large chunks of real speech missing from the output
+        # ("اختصر كتير") even though hardly any segments were dropped by our
+        # own filter, pointing at this earlier, internal cutoff instead.
+        no_speech_threshold=0.8,
+        # Re-enabled after switching to the dialect-tuned model: this was
+        # turned off earlier specifically to fight repetition-hallucination
+        # on the old stock model, but it also makes Whisper treat every
+        # segment as a fresh, context-free utterance — which encourages it
+        # to end a segment (and stop) as soon as it looks like a complete
+        # sentence, chopping continuous speech into fragments and dropping
+        # the rest. The dialect-tuned model hallucinates far less to begin
+        # with, so this trade is worth revisiting.
+        condition_on_previous_text=True,
         language=forced_language,
     )
 
