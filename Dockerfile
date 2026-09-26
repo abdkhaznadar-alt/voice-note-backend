@@ -1,6 +1,37 @@
+# ---------------------------------------------------------------------------
+# Stage 1: convert the free, dialect-tuned Arabic Whisper model
+# (oddadmix/whisper-small-arabic-dialectal-v2) from Hugging Face Transformers
+# format into CTranslate2 format, so the running service can load it
+# directly with faster-whisper — no runtime download, no per-call API cost.
+#
+# This stage needs torch + transformers only to run the one-time conversion;
+# they are NOT copied into the final image, which keeps the deployed
+# container small and fast to start.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS converter
+
+WORKDIR /convert
+COPY requirements-convert.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-convert.txt
+
+# File names checked against the actual Hugging Face repo contents: it ships
+# tokenizer_config.json / processor_config.json (not the more common
+# preprocessor_config.json / special_tokens_map.json names). faster-whisper
+# falls back to its own default mel-filter config when no
+# preprocessor_config.json is present, which is correct for standard Whisper
+# audio preprocessing, so nothing else needs to be copied.
+RUN ct2-transformers-converter \
+    --model oddadmix/whisper-small-arabic-dialectal-v2 \
+    --output_dir /convert/whisper-small-arabic-dialectal-v2-ct2 \
+    --copy_files tokenizer_config.json \
+    --quantization int8 \
+    --force
+
+# ---------------------------------------------------------------------------
+# Stage 2: the actual runtime image (small — no torch/transformers here)
+# ---------------------------------------------------------------------------
 FROM python:3.11-slim
 
-# ffmpeg is required by faster-whisper to decode audio (m4a, webm, mp3, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
@@ -10,20 +41,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY --from=converter /convert/whisper-small-arabic-dialectal-v2-ct2 /app/models/whisper-small-arabic-dialectal-v2-ct2
+
 COPY main.py .
 
-# Render assigns a PORT dynamically via environment variable (not a fixed
-# port like Hugging Face's 7860) — default to 8000 for local `docker run`
-# testing, but Render overrides this at runtime.
+ENV HF_HOME=/app/.cache/huggingface
+RUN mkdir -p /app/.cache/huggingface && chmod -R 777 /app/.cache/huggingface
+
 ENV PORT=8000
 EXPOSE 8000
 
-# A writable cache dir for the downloaded Whisper model weights — the
-# container may run as a non-root user, so /root/.cache isn't writable;
-# point the cache somewhere inside /app instead.
-ENV HF_HOME=/app/.cache/huggingface
-RUN mkdir -p /app/.cache/huggingface && chmod -R 777 /app/.cache
-
-# Shell form (not exec-array form) so $PORT actually gets substituted at
-# container start — Render sets this to whatever port it wants to route to.
 CMD uvicorn main:app --host 0.0.0.0 --port $PORT

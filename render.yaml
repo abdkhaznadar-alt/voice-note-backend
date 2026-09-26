@@ -1,14 +1,12 @@
-# Render Blueprint — optional, but lets you deploy with "New + → Blueprint"
-# instead of filling in every field by hand. If you'd rather just click
-# through the dashboard manually, you don't need this file at all — the
-# Dockerfile alone is enough.
 services:
   - type: web
-    name: voicenote-ai-backend
+    name: voice-note-backend
     runtime: docker
     plan: free
-    region: frankfurt   # closest to Germany — change if you'd prefer another region
+    region: frankfurt
     healthCheckPath: /health
     envVars:
       - key: GEMINI_API_KEY
-        sync: false   # "sync: false" = set this manually in the Render dashboard, never committed to git
+        sync: false
+      - key: USE_DIALECT_MODEL
+        value: "true"
