@@ -148,17 +148,13 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # audio for much less made-up text — the right trade for this app.
         temperature=0.0,
         compression_ratio_threshold=2.2,
-        vad_filter=True,
-        # The default VAD settings were cutting out real speech on this
-        # audio (observed: 36s of a 41s recording flagged as "silence").
-        # A lower threshold + longer allowed silence gaps keeps quieter or
-        # slower dialect speech from being discarded before it ever reaches
-        # the model.
-        vad_parameters={
-            "threshold": 0.2,
-            "min_silence_duration_ms": 1000,
-            "speech_pad_ms": 400,
-        },
+        # The VAD pre-filter kept removing real speech even after loosening
+        # its thresholds (observed: 23s of a 30s recording marked "silence").
+        # Turning it off entirely and relying on Whisper's own per-segment
+        # no_speech_prob / avg_logprob (filtered below) is more reliable for
+        # this kind of audio — nothing gets discarded before the model even
+        # sees it.
+        vad_filter=False,
         condition_on_previous_text=False,
         language=forced_language,
     )
