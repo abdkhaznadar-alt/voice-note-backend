@@ -148,13 +148,22 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # audio for much less made-up text — the right trade for this app.
         temperature=0.0,
         compression_ratio_threshold=2.2,
-        # The VAD pre-filter kept removing real speech even after loosening
-        # its thresholds (observed: 23s of a 30s recording marked "silence").
-        # Turning it off entirely and relying on Whisper's own per-segment
-        # no_speech_prob / avg_logprob (filtered below) is more reliable for
-        # this kind of audio — nothing gets discarded before the model even
-        # sees it.
-        vad_filter=False,
+        # Turning VAD off entirely (previous attempt) was worse: with real
+        # silence fed to the model, it fell into the classic Whisper failure
+        # mode of looping the same phrase over and over ("repetition
+        # hallucination") — exactly what happened on the last test. So VAD
+        # needs to stay on to keep long silence away from the model, but
+        # min_silence_duration_ms=1000 (previous setting) was too short:
+        # a LOWER value makes it MORE aggressive (any short pause that long
+        # gets cut), which is what was eating real speech. Raising it means
+        # only genuinely long gaps get removed, while brief pauses inside
+        # normal speech are kept.
+        vad_filter=True,
+        vad_parameters={
+            "threshold": 0.3,
+            "min_silence_duration_ms": 2500,
+            "speech_pad_ms": 300,
+        },
         condition_on_previous_text=False,
         language=forced_language,
     )
@@ -182,6 +191,17 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
             dropped += 1
             continue
 
+        # compression_ratio_threshold on transcribe() only matters when
+        # temperature is a *list* (it triggers a retry at higher
+        # temperature); with temperature fixed at 0.0 there's no retry, so
+        # a high-compression (i.e. repetitive) segment is returned as-is.
+        # Check it ourselves: a segment that is mostly the same phrase
+        # repeated is the classic Whisper hallucination on silence/noise.
+        compression_ratio = getattr(segment, "compression_ratio", 0.0)
+        if compression_ratio and compression_ratio > 2.4:
+            dropped += 1
+            continue
+
         kept += 1
         texts.append(segment.text.strip())
 
@@ -192,7 +212,42 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
 
     logger.info("Transcription segments: kept=%d dropped=%d", kept, dropped)
 
-    return " ".join(t for t in texts if t)
+    return _collapse_repeated_phrases(" ".join(t for t in texts if t))
+
+
+def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
+    """Last-resort safety net: if the same run of words repeats back to back
+    3+ times (the classic Whisper hallucination loop, e.g. "do X do X do X do
+    X"), collapse it down to a single occurrence instead of shipping the
+    repeated wall of text to the user."""
+    words = text.split()
+    if len(words) < 9:
+        return text
+
+    result = []
+    i = 0
+    n = len(words)
+    while i < n:
+        collapsed = False
+        for phrase_len in range(max_phrase_words, 1, -1):
+            if i + phrase_len * 3 > n:
+                continue
+            phrase = words[i : i + phrase_len]
+            repeats = 1
+            j = i + phrase_len
+            while j + phrase_len <= n and words[j : j + phrase_len] == phrase:
+                repeats += 1
+                j += phrase_len
+            if repeats >= 3:
+                result.extend(phrase)
+                i = j
+                collapsed = True
+                break
+        if not collapsed:
+            result.append(words[i])
+            i += 1
+
+    return " ".join(result)
 
 
 def _run_job(job_id: str, tmp_path: str, forced_language: Optional[str], also_analyze: bool = False):
