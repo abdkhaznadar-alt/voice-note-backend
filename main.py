@@ -147,7 +147,29 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # Forcing temperature=0 trades a little robustness on very unclear
         # audio for much less made-up text — the right trade for this app.
         temperature=0.0,
-        compression_ratio_threshold=2.2,
+        # IMPORTANT: this compression_ratio_threshold is read by
+        # faster-whisper's OWN internal decode loop (separate from the
+        # per-segment repetition check we do ourselves below, which was
+        # already removed for the same reason). We previously found that
+        # a 2.4 cutoff falsely flagged 66/68 real Arabic segments as
+        # "repetition" because Arabic text is naturally more compressible
+        # than the English text this default was tuned on — but that fix
+        # only removed OUR manual check; this engine-level value was still
+        # sitting at an even stricter 2.2, silently telling Whisper itself
+        # to reject/truncate real speech before it ever reached our code.
+        # That's what produced "a full 1-minute recording -> two words":
+        # the engine judged almost the whole segment a decode failure and
+        # gave up, rather than our post-hoc filter dropping it. Disabling
+        # it (None) here is safe because repetition is now caught entirely
+        # by our own _collapse_repeated_phrases() after transcription.
+        compression_ratio_threshold=None,
+        # Same reasoning: faster-whisper's internal log_prob_threshold
+        # (default -1.0) can silently reject/redo a segment as "low
+        # confidence" before our own avg_logprob < -1.8 filter ever sees
+        # it. We already do that filtering ourselves below with a looser,
+        # deliberately-chosen bound, so disable the engine's stricter
+        # internal gate too.
+        log_prob_threshold=None,
         # Confirmed (by the user, on continuous, uninterrupted real speech)
         # that the Silero VAD model misclassifies this app's audio as ~94%
         # silence regardless of threshold tuning — a structural mismatch
@@ -167,15 +189,16 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # ("اختصر كتير") even though hardly any segments were dropped by our
         # own filter, pointing at this earlier, internal cutoff instead.
         no_speech_threshold=0.8,
-        # Re-enabled after switching to the dialect-tuned model: this was
-        # turned off earlier specifically to fight repetition-hallucination
-        # on the old stock model, but it also makes Whisper treat every
-        # segment as a fresh, context-free utterance — which encourages it
-        # to end a segment (and stop) as soon as it looks like a complete
-        # sentence, chopping continuous speech into fragments and dropping
-        # the rest. The dialect-tuned model hallucinates far less to begin
-        # with, so this trade is worth revisiting.
-        condition_on_previous_text=True,
+        # Tried re-enabling this (True) hoping the dialect-tuned model would
+        # be immune to the classic Whisper repetition-loop failure it causes
+        # — it wasn't: the very next test produced "إيه؟ إيه؟ إيه؟..." x10+.
+        # condition_on_previous_text=True feeds the model its own prior
+        # output as context, and once it repeats a short phrase, that
+        # repetition itself becomes the context for the next step, snowballing
+        # into a loop. Confirmed worse than the "text sometimes ends too
+        # early" problem it was meant to fix, so reverted to False — a
+        # shorter-but-correct transcript beats a longer one stuck in a loop.
+        condition_on_previous_text=False,
         language=forced_language,
     )
 
@@ -261,14 +284,30 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
     return _collapse_repeated_phrases(" ".join(t for t in texts if t))
 
 
+_TRAILING_PUNCT = ".،,؟?!:؛;\"'”’…"
+
+
+def _normalize_for_repeat_check(word: str) -> str:
+    """Loose comparison key for repetition detection: strips leading/trailing
+    punctuation and collapses to lowercase, so 'إيه؟' and 'إيه' (or one with
+    a stray extra space captured as part of the token) are recognized as the
+    same repeated word instead of silently evading the exact-match check —
+    which is exactly what let a real "إيه؟ إيه؟ إيه؟..." loop through when
+    segments decoded it with tiny, meaningless punctuation differences."""
+    return word.strip(_TRAILING_PUNCT).lower()
+
+
 def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
     """Last-resort safety net: if the same run of words repeats back to back
     3+ times (the classic Whisper hallucination loop, e.g. "do X do X do X do
     X"), collapse it down to a single occurrence instead of shipping the
-    repeated wall of text to the user."""
+    repeated wall of text to the user. Compares words loosely (punctuation-
+    insensitive) so near-identical repeats aren't missed, but keeps the
+    original text in the output."""
     words = text.split()
     if len(words) < 3:
         return text
+    keys = [_normalize_for_repeat_check(w) for w in words]
 
     result = []
     i = 0
@@ -282,14 +321,16 @@ def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
         for phrase_len in range(max_phrase_words, 0, -1):
             if i + phrase_len * 3 > n:
                 continue
-            phrase = words[i : i + phrase_len]
+            phrase_key = keys[i : i + phrase_len]
+            if all(k == "" for k in phrase_key):
+                continue  # pure punctuation, not a meaningful repeat
             repeats = 1
             j = i + phrase_len
-            while j + phrase_len <= n and words[j : j + phrase_len] == phrase:
+            while j + phrase_len <= n and keys[j : j + phrase_len] == phrase_key:
                 repeats += 1
                 j += phrase_len
             if repeats >= 3:
-                result.extend(phrase)
+                result.extend(words[i : i + phrase_len])
                 i = j
                 collapsed = True
                 break
