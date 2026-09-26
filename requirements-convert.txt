@@ -1,3 +1,5 @@
 transformers>=4.46,<5
 torch==2.4.1
 ctranslate2==4.8.2
+protobuf
+sentencepiece
