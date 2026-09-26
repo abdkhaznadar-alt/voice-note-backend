@@ -204,7 +204,9 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
 
     total_duration = getattr(info, "duration", None) or 0.0
     texts = []
+    kept_segments = []  # (start, end, text) for kept segments — timings drive the turn/speaker split below
     low_confidence_texts = []  # dropped by no_speech/avg_logprob, but not repetition — used as a fallback
+    low_confidence_segments = []  # timed version of the above, for the same fallback but with turn splitting
     kept = 0
     dropped = 0
     dropped_repetition = 0
@@ -243,6 +245,7 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
             stripped = segment.text.strip()
             if stripped:
                 low_confidence_texts.append(stripped)
+                low_confidence_segments.append((segment.start, segment.end, stripped))
             continue
 
         # Per-segment repetition check (language-agnostic, unlike the
@@ -262,6 +265,7 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
 
         kept += 1
         texts.append(stripped)
+        kept_segments.append((segment.start, segment.end, stripped))
 
         if job_id is not None and total_duration > 0:
             with jobs_lock:
@@ -280,8 +284,61 @@ def _transcribe_file_sync(tmp_path: str, forced_language: Optional[str], job_id:
         # transcript than a blank one.
         logger.info("All segments were low-confidence; using them as a fallback instead of returning empty text.")
         texts = low_confidence_texts
+        kept_segments = low_confidence_segments
 
-    return _collapse_repeated_phrases(" ".join(t for t in texts if t))
+    return _label_turns_by_pause(kept_segments)
+
+
+# A pause longer than this between two segments is treated as a likely
+# change of speaker (e.g. the professor stops, a student starts talking).
+# This is a lightweight heuristic, NOT real speaker identification (that
+# would need a separate voice-diarization model such as pyannote, which is
+# too heavy/slow to run on this Railway plan) — it only distinguishes
+# "someone new probably started talking" from "the same person kept going",
+# based purely on timing. Requested explicitly as the lightweight option
+# (vs. real per-voice diarization) to keep the backend fast and free.
+_SPEAKER_PAUSE_SECONDS = 1.5
+
+
+def _label_turns_by_pause(segments) -> str:
+    """Group timed (start, end, text) segments into "turns" whenever the gap
+    since the previous segment exceeds _SPEAKER_PAUSE_SECONDS, and prefix
+    each turn with an alternating generic label (المتحدث 1 / المتحدث 2).
+    This approximates who's talking in a lecture/Q&A recording without a
+    heavy dedicated diarization model. It cannot tell two different people
+    apart if they happen to speak back-to-back with no pause, and it will
+    mislabel a single speaker's own long pause (e.g. thinking mid-sentence)
+    as a "new speaker" — a known limitation of timing-only heuristics,
+    which is the trade-off for staying free and fast to run."""
+    if not segments:
+        return ""
+
+    turns = []
+    current_texts = [segments[0][2]]
+    current_start = segments[0][0]
+    prev_end = segments[0][1]
+
+    for start, end, text in segments[1:]:
+        if start - prev_end > _SPEAKER_PAUSE_SECONDS:
+            turns.append((current_start, current_texts))
+            current_texts = [text]
+            current_start = start
+        else:
+            current_texts.append(text)
+        prev_end = end
+    turns.append((current_start, current_texts))
+
+    labels = ["المتحدث 1", "المتحدث 2"]
+    lines = []
+    for i, (start, turn_texts) in enumerate(turns):
+        label = labels[i % 2]
+        turn_text = _collapse_repeated_phrases(" ".join(t for t in turn_texts if t))
+        if not turn_text:
+            continue
+        timestamp = f"{int(start // 60):02d}:{int(start % 60):02d}"
+        lines.append(f"[{timestamp}] {label}: {turn_text}")
+
+    return "\n".join(lines)
 
 
 _TRAILING_PUNCT = ".،,؟?!:؛;\"'”’…"
@@ -329,7 +386,28 @@ def _collapse_repeated_phrases(text: str, max_phrase_words: int = 8) -> str:
             while j + phrase_len <= n and keys[j : j + phrase_len] == phrase_key:
                 repeats += 1
                 j += phrase_len
-            if repeats >= 3:
+            # How many back-to-back repeats count as a hallucination loop
+            # depends on the phrase itself:
+            #  - multi-word phrases (phrase_len >= 2): 2 repeats is already
+            #    enough. A real speaker essentially never says the exact
+            #    same 2+ word phrase twice in a row with zero variation —
+            #    that pattern is a decode artifact, not natural speech.
+            #  - short single words (< 4 letters, e.g. "لا", "يا", "طب"):
+            #    keep requiring 3+ repeats, because doubling a short filler
+            #    for emphasis ("لا لا", "طب طب") IS normal in everyday
+            #    Levantine speech and shouldn't be erased.
+            #  - longer single words (>= 4 letters, e.g. "صيدلية"): 2 back-
+            #    to-back repeats is already enough. Reported directly by the
+            #    user ("صيدلية صيدلية" showing up untouched in a transcript)
+            #    — a real word doubled like that is decode noise, not
+            #    emphasis, so it's collapsed the same as a multi-word loop.
+            if phrase_len >= 2:
+                min_repeats = 2
+            elif len(phrase_key[0]) >= 4:
+                min_repeats = 2
+            else:
+                min_repeats = 3
+            if repeats >= min_repeats:
                 result.extend(words[i : i + phrase_len])
                 i = j
                 collapsed = True
